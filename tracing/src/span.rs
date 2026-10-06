@@ -318,7 +318,7 @@
 //! [guard]: Entered
 //! [parent]: #span-relationships
 
-pub use tracing_core::span::{Attributes, Id, Record};
+pub use tracing_core::span::{Attributes, Id, Record, RecordPlan, RecordSources};
 
 use crate::{
     dispatcher::{self, Dispatch},
@@ -1246,6 +1246,21 @@ impl Span {
         }
 
         self
+    }
+
+    /// Returns a [`RecordPlan`] for recording values for this span's fields,
+    /// or `None` if this span is [`Span::none`].
+    ///
+    /// The returned plan is tied to the callsite that declared this span's
+    /// fields: it resolves field names to the actual [`Field`]s of *that*
+    /// callsite, so values recorded later are associated with the correct
+    /// `Field` even when another callsite declares a field with the same
+    /// name. Generating the plan never visits any recorded values.
+    ///
+    /// [`RecordPlan`]: crate::span::RecordPlan
+    /// [`Field`]: crate::field::Field
+    pub fn record_plan(&self) -> Option<RecordPlan> {
+        self.meta.map(RecordPlan::new)
     }
 
     /// Returns `true` if this span was disabled by the subscriber and does not

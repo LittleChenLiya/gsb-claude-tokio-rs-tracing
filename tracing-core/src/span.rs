@@ -4,7 +4,7 @@ use core::num::NonZeroU64;
 
 use crate::field::FieldSet;
 use crate::parent::Parent;
-use crate::{field, Metadata};
+use crate::{callsite, field, Metadata};
 
 /// Identifies a span within the context of a subscriber.
 ///
@@ -29,6 +29,40 @@ pub struct Attributes<'a> {
 /// A set of fields recorded by a span.
 #[derive(Debug)]
 pub struct Record<'a> {
+    values: &'a field::ValueSet<'a>,
+}
+
+/// A plan for recording values for the fields of spans from a single
+/// callsite.
+///
+/// A `RecordPlan` is constructed from the [`Metadata`] describing a span
+/// callsite, and resolves field names to the actual [`Field`]s declared by
+/// *that* callsite. Because the plan is tied to the callsite's
+/// [identity][`callsite::Identifier`], fields declared by other callsites are
+/// never associated with this plan &mdash; even if those callsites declare
+/// fields with the same names. This allows values to be recorded later (after
+/// a span has been created) while still targeting the correct [`Field`].
+///
+/// The plan only describes *where* values will be recorded: generating a
+/// plan, or a [`RecordSources`] report from one, never visits the recorded
+/// values themselves.
+///
+/// [`Field`]: crate::field::Field
+#[derive(Debug, Clone)]
+pub struct RecordPlan {
+    metadata: &'static Metadata<'static>,
+}
+
+/// A report of the sources that a set of recorded values targets.
+///
+/// This is returned by [`RecordPlan::sources`]. The report retains only the
+/// *source* of each recorded value &mdash; the callsite and [`Field`] it will
+/// be recorded for &mdash; and never the values themselves: constructing and
+/// inspecting a `RecordSources` does not visit any values.
+///
+/// [`Field`]: crate::field::Field
+#[derive(Debug)]
+pub struct RecordSources<'a> {
     values: &'a field::ValueSet<'a>,
 }
 
@@ -243,6 +277,129 @@ impl<'a> Record<'a> {
     /// Returns true if this `Record` contains _no_ values.
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+}
+
+// ===== impl RecordPlan =====
+
+impl RecordPlan {
+    /// Returns a new `RecordPlan` for the span callsite described by
+    /// `metadata`.
+    pub fn new(metadata: &'static Metadata<'static>) -> Self {
+        Self { metadata }
+    }
+
+    /// Returns an [`Identifier`] that uniquely identifies the [`Callsite`]
+    /// this plan records fields for.
+    ///
+    /// [`Identifier`]: crate::callsite::Identifier
+    /// [`Callsite`]: crate::callsite::Callsite
+    pub fn callsite(&self) -> callsite::Identifier {
+        self.metadata.callsite()
+    }
+
+    /// Returns the set of all fields declared by this plan's callsite.
+    pub fn fields(&self) -> &FieldSet {
+        self.metadata.fields()
+    }
+
+    /// Resolves the field named `name` to the [`Field`] declared by *this*
+    /// plan's callsite, or returns `None` if the callsite declares no field
+    /// with that name.
+    ///
+    /// Fields declared by other callsites are never returned, even if they
+    /// share a name with one of this callsite's fields: two callsites that
+    /// both declare a field named `name` are associated with distinct
+    /// [`Field`]s, and each plan resolves `name` to its own callsite's
+    /// `Field`.
+    ///
+    /// [`Field`]: crate::field::Field
+    pub fn field(&self, name: &str) -> Option<field::Field> {
+        self.metadata.fields().field(name)
+    }
+
+    /// Returns `true` if `field` was declared by this plan's callsite.
+    pub fn contains(&self, field: &field::Field) -> bool {
+        self.metadata.fields().contains(field)
+    }
+
+    /// Returns `true` if `values` originates from this plan's callsite, and
+    /// may therefore be recorded through this plan.
+    pub fn accepts(&self, values: &field::ValueSet<'_>) -> bool {
+        values.callsite() == self.callsite()
+    }
+
+    /// Returns a [`Record`] for `values` if they originate from this plan's
+    /// callsite, or `None` if they originate from a different callsite.
+    ///
+    /// This is a checked complement to the existing [`Record::new`]
+    /// constructor, which remains unchanged; the returned `Record` records
+    /// values for the [`Field`]s of this plan's callsite.
+    ///
+    /// [`Field`]: crate::field::Field
+    pub fn record<'a>(&self, values: &'a field::ValueSet<'a>) -> Option<Record<'a>> {
+        if self.accepts(values) {
+            Some(Record::new(values))
+        } else {
+            None
+        }
+    }
+
+    /// Returns a [`RecordSources`] report describing where the given `values`
+    /// would be recorded, or `None` if they originate from a different
+    /// callsite.
+    ///
+    /// The report retains only the *source* of each value &mdash; the
+    /// callsite and [`Field`] it targets. Generating the report never visits
+    /// the values themselves.
+    ///
+    /// [`Field`]: crate::field::Field
+    pub fn sources<'a>(&self, values: &'a field::ValueSet<'a>) -> Option<RecordSources<'a>> {
+        if self.accepts(values) {
+            Some(RecordSources { values })
+        } else {
+            None
+        }
+    }
+}
+
+// ===== impl RecordSources =====
+
+impl<'a> RecordSources<'a> {
+    /// Returns an [`Identifier`] that uniquely identifies the [`Callsite`]
+    /// that all fields in this report belong to.
+    ///
+    /// [`Identifier`]: crate::callsite::Identifier
+    /// [`Callsite`]: crate::callsite::Callsite
+    pub fn callsite(&self) -> callsite::Identifier {
+        self.values.callsite()
+    }
+
+    /// Returns an iterator over the [`Field`]s that values would be recorded
+    /// for, without visiting the values.
+    ///
+    /// [`Field`]: crate::field::Field
+    pub fn fields(&self) -> field::ValueFields<'_> {
+        self.values.value_fields()
+    }
+
+    /// Returns the number of [`Field`]s that values would be recorded for.
+    ///
+    /// [`Field`]: crate::field::Field
+    pub fn len(&self) -> usize {
+        self.values.value_fields().count()
+    }
+
+    /// Returns `true` if no values would be recorded.
+    pub fn is_empty(&self) -> bool {
+        self.values.value_fields().next().is_none()
+    }
+
+    /// Returns `true` if a value would be recorded for the given [`Field`].
+    ///
+    /// [`Field`]: crate::field::Field
+    pub fn contains(&self, field: &field::Field) -> bool {
+        self.values.contains(field)
     }
 }
 

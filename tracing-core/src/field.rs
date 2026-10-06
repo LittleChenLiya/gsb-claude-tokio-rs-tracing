@@ -1132,8 +1132,77 @@ impl ValueSet<'_> {
         }
     }
 
+    /// Returns an iterator over the [`Field`]s in this `ValueSet` for which a
+    /// value would be recorded, without visiting any of the values.
+    ///
+    /// The returned iterator yields the same [`Field`]s, in the same order,
+    /// as those that would be visited by [`ValueSet::record`]. However,
+    /// unlike [`ValueSet::record`], it never touches the recorded values
+    /// themselves, so it may be used to determine *where* values will be
+    /// recorded without observing *what* will be recorded.
+    pub fn value_fields(&self) -> ValueFields<'_> {
+        ValueFields { set: self, idx: 0 }
+    }
+
     pub(crate) fn field_set(&self) -> &FieldSet {
         self.fields
+    }
+}
+
+// ===== impl ValueFields =====
+
+/// An iterator over the [`Field`]s in a [`ValueSet`] for which a value would
+/// be recorded.
+///
+/// This iterator yields only the [`Field`]s that the values in a [`ValueSet`]
+/// will be recorded for; the values themselves are never visited. It is
+/// returned by the [`ValueSet::value_fields`] method.
+#[derive(Debug)]
+pub struct ValueFields<'a> {
+    set: &'a ValueSet<'a>,
+    idx: usize,
+}
+
+impl Iterator for ValueFields<'_> {
+    type Item = Field;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match &self.set.values {
+            Values::Explicit(values) => {
+                let my_callsite = self.set.callsite();
+                while let Some((field, value)) = values.get(self.idx) {
+                    self.idx += 1;
+                    if field.callsite() == my_callsite && value.is_some() {
+                        return Some((*field).clone());
+                    }
+                }
+                None
+            }
+            Values::All(values) => {
+                while let Some(value) = values.get(self.idx) {
+                    let i = self.idx;
+                    self.idx += 1;
+                    if value.is_some() {
+                        return Some(Field {
+                            i,
+                            fields: FieldSet {
+                                names: self.set.fields.names,
+                                callsite: self.set.fields.callsite(),
+                            },
+                        });
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = match &self.set.values {
+            Values::Explicit(values) => values.len() - self.idx,
+            Values::All(values) => values.len() - self.idx,
+        };
+        (0, Some(remaining))
     }
 }
 
