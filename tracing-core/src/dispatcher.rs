@@ -724,6 +724,39 @@ impl Dispatch {
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         <dyn Subscriber>::downcast_ref(self.subscriber())
     }
+
+    /// Returns `true` if `self` and `other` dispatch to the same
+    /// [`Subscriber`] instance.
+    ///
+    /// Two `Dispatch`es refer to the same subscriber if they were cloned from
+    /// one another, or if they otherwise point to the same subscriber in
+    /// memory &mdash; for example, a `Dispatch` and the [global default]
+    /// initialized from a clone of it.
+    ///
+    /// This can be used to verify that a handle which was created while one
+    /// subscriber was the default is still being used with that same
+    /// subscriber, rather than with a different subscriber that has since
+    /// replaced it.
+    ///
+    /// [global default]: crate::dispatcher::set_global_default
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tracing_core::{Dispatch, subscriber::NoSubscriber};
+    ///
+    /// let foo = Dispatch::new(NoSubscriber::new());
+    /// let bar = foo.clone();
+    /// assert!(foo.ptr_eq(&bar));
+    ///
+    /// // A separately-constructed `Dispatch` is a *different* subscriber,
+    /// // even if it has the same type.
+    /// let baz = Dispatch::new(NoSubscriber::new());
+    /// assert!(!foo.ptr_eq(&baz));
+    /// ```
+    pub fn ptr_eq(&self, other: &Dispatch) -> bool {
+        core::ptr::eq(self.subscriber(), other.subscriber())
+    }
 }
 
 impl Default for Dispatch {

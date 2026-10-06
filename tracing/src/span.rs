@@ -411,6 +411,82 @@ pub struct EnteredSpan {
     _not_send: PhantomNotSend,
 }
 
+/// A credential permitting a [`Span`] to be entered, potentially on a
+/// different thread than the one where the span was created.
+///
+/// This is returned by the [`Span::enter_ticket`] method.
+///
+/// Unlike the [`Entered`] and [`EnteredSpan`] guards, an `EnterTicket`
+/// implements [`Send`] and [`Sync`], so it may be freely moved (or shared)
+/// across threads. Rather than moving an entry guard to another thread ---
+/// which would exit the span on a thread that never entered it --- the ticket
+/// itself is sent, and [`EnterTicket::enter`] is called on the destination
+/// thread. This returns a new guard which exits the span on *that* thread
+/// when dropped.
+///
+/// A ticket is bound at creation time to the identity of the [`Subscriber`]
+/// that enabled the span, and to that span's [`Id`]. When
+/// [`EnterTicket::enter`] is called, the ticket is only honored if the
+/// subscriber that issued it is still the current default subscriber on the
+/// calling thread; otherwise, the ticket is rejected with a
+/// [`SubscriberMismatch`] error and the span is not entered.
+///
+/// [`Subscriber`]: super::subscriber::Subscriber
+/// [`Span::enter_ticket`]: super::Span::enter_ticket
+/// [`EnterTicket::enter`]: EnterTicket::enter
+#[derive(Debug)]
+pub struct EnterTicket {
+    /// A handle used to enter the span, keeping it alive for as long as the
+    /// ticket exists.
+    ///
+    /// If this is `None`, then the span has either closed or was never
+    /// enabled, and entering the ticket is a no-op.
+    inner: Option<Inner>,
+}
+
+/// A guard representing a span which has been entered on the current thread
+/// via an [`EnterTicket`].
+///
+/// When the guard is dropped, the span will be exited on this thread.
+///
+/// This is returned by the [`EnterTicket::enter`] function.
+///
+/// This guard does not implement [`Send`]: it must be dropped on the same
+/// thread on which [`EnterTicket::enter`] was called, so that the span is
+/// exited on the thread that entered it. To enter the span on another
+/// thread, send the [`EnterTicket`] to that thread and call
+/// [`EnterTicket::enter`] there instead.
+///
+/// [`EnterTicket::enter`]: EnterTicket::enter
+#[derive(Debug)]
+#[must_use = "once a span has been entered, it should be exited"]
+pub struct EnteredTicket {
+    inner: Option<Inner>,
+
+    /// ```compile_fail
+    /// use tracing::span::*;
+    /// trait AssertSend: Send {}
+    ///
+    /// impl AssertSend for EnteredTicket {}
+    /// ```
+    _not_send: PhantomNotSend,
+}
+
+/// An error returned by [`EnterTicket::enter`] when the [`Subscriber`] that
+/// issued the ticket is not the current default subscriber on the calling
+/// thread.
+///
+/// When this error is returned, the span was *not* entered. The ticket is
+/// not consumed by [`EnterTicket::enter`], so it may be used again once the
+/// issuing subscriber is the current default.
+///
+/// [`Subscriber`]: super::subscriber::Subscriber
+/// [`EnterTicket::enter`]: EnterTicket::enter
+#[derive(Debug)]
+pub struct SubscriberMismatch {
+    _no_construct: (),
+}
+
 /// `log` target for all span lifecycle (creation/enter/exit/close) records.
 #[cfg(feature = "log")]
 const LIFECYCLE_LOG_TARGET: &str = "tracing::span";
@@ -912,6 +988,50 @@ impl Span {
         EnteredSpan {
             span: self,
             _not_send: PhantomNotSend,
+        }
+    }
+
+    /// Returns an [`EnterTicket`]: a credential that permits this span to be
+    /// entered later, potentially on a different thread than the one where
+    /// the span was created.
+    ///
+    /// The ticket binds the identity of the [`Subscriber`] that enabled this
+    /// span together with this span's [`Id`], and keeps the span alive for as
+    /// long as the ticket exists. Unlike the [`EnteredSpan`] guard, the
+    /// ticket implements [`Send`] and [`Sync`], so it may be moved to another
+    /// thread and used to enter the span there. The [`EnteredTicket`] guard
+    /// returned by [`EnterTicket::enter`] exits the span on the thread that
+    /// entered it, and cannot itself be sent to another thread.
+    ///
+    /// If the span is disabled, the returned ticket's
+    /// [`enter`][EnterTicket::enter] method does nothing, similarly to
+    /// [`Span::enter`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tracing::info_span;
+    /// use std::thread;
+    ///
+    /// let span = info_span!("my_span");
+    /// let ticket = span.enter_ticket();
+    ///
+    /// // The ticket --- unlike an `EnteredSpan` guard --- may be sent to
+    /// // another thread, and used to enter the span there.
+    /// thread::spawn(move || {
+    ///     let _guard = ticket.enter().expect("no subscriber replaced the default");
+    ///     // do some work in the span on this thread...
+    /// })
+    /// .join()
+    /// .unwrap();
+    /// ```
+    ///
+    /// [`Subscriber`]: super::subscriber::Subscriber
+    /// [`EnterTicket::enter`]: EnterTicket::enter
+    /// [`Id`]: super::Id
+    pub fn enter_ticket(&self) -> EnterTicket {
+        EnterTicket {
+            inner: self.inner.clone(),
         }
     }
 
@@ -1589,6 +1709,165 @@ impl Drop for EnteredSpan {
         self.span.do_exit()
     }
 }
+
+// ===== impl EnterTicket =====
+
+impl EnterTicket {
+    /// Enters the span this ticket was issued for on the current thread,
+    /// returning a [guard][`EnteredTicket`] that will exit the span when
+    /// dropped.
+    ///
+    /// The returned guard does not implement [`Send`]: it must be dropped on
+    /// the thread that called this method, so that the span is exited on the
+    /// same thread that entered it. To enter the span on another thread,
+    /// move (or share) the *ticket* to that thread and call this method
+    /// there, rather than moving the guard.
+    ///
+    /// If the span is disabled, this method does nothing and returns an
+    /// inert guard, similarly to [`Span::enter`].
+    ///
+    /// # Errors
+    ///
+    /// This method returns a [`SubscriberMismatch`] error --- and does *not*
+    /// enter the span --- if the [`Subscriber`] that issued this ticket is
+    /// not the current default subscriber on the calling thread. This
+    /// ensures that a ticket is never honored after its subscriber has been
+    /// replaced by a different one.
+    ///
+    /// # Examples
+    ///
+    /// A ticket is rejected once the subscriber that issued it is no longer
+    /// the current default:
+    ///
+    /// ```
+    /// use tracing::{info_span, Dispatch};
+    /// # use tracing::{Metadata, Subscriber};
+    /// # use tracing::span::{Attributes, Id, Record};
+    /// # #[derive(Debug)]
+    /// # struct AnySubscriber;
+    /// # impl Subscriber for AnySubscriber {
+    /// #     fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+    /// #     fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+    /// #     fn record(&self, _: &Id, _: &Record<'_>) {}
+    /// #     fn record_follows_from(&self, _: &Id, _: &Id) {}
+    /// #     fn event(&self, _: &tracing::Event<'_>) {}
+    /// #     fn enter(&self, _: &Id) {}
+    /// #     fn exit(&self, _: &Id) {}
+    /// # }
+    /// let subscriber_a = Dispatch::new(AnySubscriber);
+    /// let subscriber_b = Dispatch::new(AnySubscriber);
+    ///
+    /// // Issue a ticket while `subscriber_a` is the default.
+    /// let ticket = tracing::dispatcher::with_default(&subscriber_a, || {
+    ///     info_span!("my_span").enter_ticket()
+    /// });
+    ///
+    /// // While `subscriber_a` is the default, the ticket is honored.
+    /// tracing::dispatcher::with_default(&subscriber_a, || {
+    ///     let _guard = ticket.enter().expect("the issuing subscriber is the default");
+    /// });
+    ///
+    /// // Once the subscriber has been replaced, the ticket is rejected.
+    /// tracing::dispatcher::with_default(&subscriber_b, || {
+    ///     assert!(ticket.enter().is_err());
+    /// });
+    /// ```
+    ///
+    /// [`Subscriber`]: super::subscriber::Subscriber
+    pub fn enter(&self) -> Result<EnteredTicket, SubscriberMismatch> {
+        let inner = match self.inner.as_ref() {
+            Some(inner) => inner,
+            // The span is disabled, so entering it does nothing, similarly to
+            // `Span::enter`.
+            None => {
+                return Ok(EnteredTicket {
+                    inner: None,
+                    _not_send: PhantomNotSend,
+                })
+            }
+        };
+
+        // The ticket is only honored if the subscriber that issued it is
+        // still the current default subscriber on this thread.
+        let matches = dispatcher::get_default(|default| default.ptr_eq(&inner.subscriber));
+        if !matches {
+            return Err(SubscriberMismatch { _no_construct: () });
+        }
+
+        inner.subscriber.enter(&inner.id);
+        Ok(EnteredTicket {
+            // The guard borrows the ticket's span reference rather than
+            // cloning the span handle, so it must not close the span when it
+            // is dropped; it only exits the span.
+            inner: Some(Inner {
+                id: inner.id.clone(),
+                subscriber: inner.subscriber.clone(),
+            }),
+            _not_send: PhantomNotSend,
+        })
+    }
+
+    /// Returns the `Id` of the span this ticket enters, if the span is
+    /// enabled.
+    pub fn id(&self) -> Option<Id> {
+        self.inner.as_ref().map(Inner::id)
+    }
+}
+
+impl Drop for EnterTicket {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // Like `Span::drop`, dropping the ticket releases the ticket's
+        // reference to the span.
+        if let Some(Inner {
+            ref id,
+            ref subscriber,
+        }) = self.inner
+        {
+            subscriber.try_close(id.clone());
+        }
+    }
+}
+
+// ===== impl EnteredTicket =====
+
+impl EnteredTicket {
+    /// Returns the `Id` of the entered span, if it is enabled.
+    pub fn id(&self) -> Option<Id> {
+        self.inner.as_ref().map(Inner::id)
+    }
+}
+
+impl Drop for EnteredTicket {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // Exit the span on this thread. Note that the guard does *not* close
+        // the span: the span's lifetime is owned by the `Span` and
+        // `EnterTicket` handles, not by the entry guard.
+        if let Some(Inner {
+            ref id,
+            ref subscriber,
+        }) = self.inner
+        {
+            subscriber.exit(id);
+        }
+    }
+}
+
+// ===== impl SubscriberMismatch =====
+
+impl fmt::Display for SubscriberMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(
+            "span entry ticket rejected: the subscriber that issued the ticket \
+             is not the current default subscriber on this thread",
+        )
+    }
+}
+
+#[cfg(feature = "std")]
+#[cfg_attr(docsrs, doc(cfg(feature = "std")))]
+impl std::error::Error for SubscriberMismatch {}
 
 /// Technically, `EnteredSpan` _can_ implement both `Send` *and*
 /// `Sync` safely. It doesn't, because it has a `PhantomNotSend` field,
