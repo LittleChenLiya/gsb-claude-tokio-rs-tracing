@@ -12,6 +12,12 @@ pub mod debug;
 pub mod delimited;
 pub mod display;
 
+feature! {
+    #![feature = "alloc"]
+    mod record_plan;
+    pub use self::record_plan::{FieldState, RecordPlan};
+}
+
 /// Creates new [visitors].
 ///
 /// A type implementing `MakeVisitor` represents a composable factory for types
