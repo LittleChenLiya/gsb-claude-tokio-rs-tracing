@@ -724,6 +724,26 @@ impl Dispatch {
     pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
         <dyn Subscriber>::downcast_ref(self.subscriber())
     }
+
+    /// Returns `true` if `self` and `other` dispatch to the *same*
+    /// [`Subscriber`] instance.
+    ///
+    /// This compares the identity of the subscribers that the two
+    /// `Dispatch`es forward to, rather than their types. It can be used to
+    /// determine whether a span handle created by one subscriber is being
+    /// used while that same subscriber is the current default.
+    ///
+    /// Note that this is a conservative check: two `Dispatch`es that were
+    /// constructed separately from the same subscriber value (rather than
+    /// cloned from one another) are *not* considered the same.
+    #[inline]
+    pub fn is_same(&self, other: &Dispatch) -> bool {
+        match (&self.subscriber, &other.subscriber) {
+            (Kind::Global(a), Kind::Global(b)) => core::ptr::eq(*a, *b),
+            (Kind::Scoped(a), Kind::Scoped(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 impl Default for Dispatch {
