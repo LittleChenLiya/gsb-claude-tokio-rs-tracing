@@ -1,5 +1,7 @@
 use tracing_core::{metadata::Metadata, span, subscriber::Subscriber, Event};
 
+use core::fmt;
+
 use crate::registry::{self, LookupSpan, SpanRef};
 
 #[cfg(all(feature = "registry", feature = "std"))]
@@ -170,13 +172,85 @@ where
     where
         S: for<'lookup> LookupSpan<'lookup>,
     {
-        if event.is_root() {
-            None
-        } else if event.is_contextual() {
-            self.lookup_current()
-        } else {
-            // TODO(eliza): this should handle parent IDs
-            event.parent().and_then(|id| self.span(id))
+        match self.event_parent(event) {
+            EventParent::Root | EventParent::Unknown(_) => None,
+            EventParent::Current(current) => current,
+            EventParent::Explicit(span) => Some(span),
+        }
+    }
+
+    /// Returns a read-only classification of the given [`Event`]'s parent
+    /// span, as resolved against this subscriber's span registry.
+    ///
+    /// This classifies the event's parent provenance into one of four cases:
+    ///
+    /// - [`EventParent::Explicit`]: the event has an explicitly-specified
+    ///   parent span, and that span is known to this subscriber,
+    /// - [`EventParent::Current`]: the event's parent is determined
+    ///   contextually, based on the current span (if one is entered),
+    /// - [`EventParent::Root`]: the event's parent was *explicitly* set to
+    ///   `None`; it is a root and does **not** fall back to the current span,
+    /// - [`EventParent::Unknown`]: the event has an explicitly-specified
+    ///   parent span ID that is *not* known to this subscriber (for example,
+    ///   because the parent span was created by a different [`Dispatch`]er).
+    ///   The unknown parent is reported as-is, rather than fabricating an
+    ///   association with the current span or silently treating the event as
+    ///   a root.
+    ///
+    /// Unlike [`Context::event_span`], which flattens all of these cases into
+    /// an `Option`, this method preserves *why* an event has (or does not
+    /// have) a parent span. This does not change how events are dispatched to
+    /// subscribers; it only exposes additional read-only information about
+    /// events that have already been dispatched.
+    ///
+    /// [`Dispatch`]: tracing_core::dispatch::Dispatch
+    ///
+    /// ```rust
+    /// use tracing::{Event, Subscriber};
+    /// use tracing_subscriber::{
+    ///     layer::{Context, EventParent, Layer},
+    ///     prelude::*,
+    ///     registry::LookupSpan,
+    /// };
+    ///
+    /// struct PrintingLayer;
+    /// impl<S> Layer<S> for PrintingLayer
+    /// where
+    ///     S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    /// {
+    ///     fn on_event(&self, event: &Event, ctx: Context<S>) {
+    ///         match ctx.event_parent(event) {
+    ///             EventParent::Explicit(span) => println!("explicit parent: {:?}", span.name()),
+    ///             EventParent::Current(Some(span)) => println!("current span: {:?}", span.name()),
+    ///             EventParent::Current(None) => println!("no current span"),
+    ///             EventParent::Root => println!("root event"),
+    ///             EventParent::Unknown(id) => println!("unknown parent: {:?}", id),
+    ///             _ => println!("other parent kind"),
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// <pre class="ignore" style="white-space:normal;font:inherit;">
+    ///     <strong>Note</strong>: This requires the wrapped subscriber to
+    ///     implement the <a href="../registry/trait.LookupSpan.html"><code>
+    ///     LookupSpan</code></a> trait. See the documentation on
+    ///     <a href="./struct.Context.html"><code>Context</code>'s
+    ///     declaration</a> for details.
+    /// </pre>
+    #[inline]
+    pub fn event_parent<'this>(&'this self, event: &Event<'_>) -> EventParent<'this, S>
+    where
+        S: for<'lookup> LookupSpan<'lookup>,
+    {
+        use tracing_core::event::ParentKind;
+        match event.parent_kind() {
+            ParentKind::Root => EventParent::Root,
+            ParentKind::Current => EventParent::Current(self.lookup_current()),
+            ParentKind::Explicit(id) => match self.span(id) {
+                Some(span) => EventParent::Explicit(span),
+                None => EventParent::Unknown(id.clone()),
+            },
         }
     }
 
@@ -428,6 +502,82 @@ impl<S> Clone for Context<'_, S> {
 
             #[cfg(all(feature = "registry", feature = "std"))]
             filter: self.filter,
+        }
+    }
+}
+
+/// A read-only classification of an [`Event`]'s parent span, as resolved
+/// against a subscriber's span registry.
+///
+/// Returned by [`Context::event_parent`]. See that method's documentation for
+/// details on each case.
+#[non_exhaustive]
+pub enum EventParent<'a, S>
+where
+    S: LookupSpan<'a>,
+{
+    /// The event is a root: its parent was *explicitly* set to `None`, and it
+    /// does not fall back to the current span.
+    Root,
+    /// The event's parent is determined contextually. This contains the
+    /// current span, if one is currently entered; otherwise, the event is the
+    /// root of its own trace tree.
+    Current(Option<SpanRef<'a, S>>),
+    /// The event has an explicitly-specified parent span, which is known to
+    /// this subscriber's registry.
+    Explicit(SpanRef<'a, S>),
+    /// The event has an explicitly-specified parent span ID that is *not*
+    /// known to this subscriber's registry (for example, because the parent
+    /// span was created by a different [`Dispatch`]er).
+    ///
+    /// The unknown parent ID is reported as-is, rather than fabricating an
+    /// association with the current span or treating the event as a root.
+    ///
+    /// [`Dispatch`]: tracing_core::dispatch::Dispatch
+    Unknown(span::Id),
+}
+
+impl<'a, S> EventParent<'a, S>
+where
+    S: LookupSpan<'a>,
+{
+    /// Returns `true` if the event's parent was explicitly specified (whether
+    /// or not that parent is known to this subscriber).
+    pub fn is_explicit(&self) -> bool {
+        matches!(self, Self::Explicit(_) | Self::Unknown(_))
+    }
+
+    /// Returns a reference to the resolved parent [`SpanRef`], if the event
+    /// has a parent span known to this subscriber.
+    ///
+    /// This returns `None` for root events, contextual events recorded
+    /// outside of any span, and events with an unknown explicit parent.
+    pub fn span(&self) -> Option<&SpanRef<'a, S>> {
+        match self {
+            Self::Explicit(span) => Some(span),
+            Self::Current(current) => current.as_ref(),
+            Self::Root | Self::Unknown(_) => None,
+        }
+    }
+}
+
+impl<S> fmt::Debug for EventParent<'_, S>
+where
+    S: for<'lookup> LookupSpan<'lookup>,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Root => f.write_str("EventParent::Root"),
+            Self::Current(Some(span)) => f
+                .debug_tuple("EventParent::Current")
+                .field(&format_args!("Some({:?})", span.name()))
+                .finish(),
+            Self::Current(None) => f.write_str("EventParent::Current(None)"),
+            Self::Explicit(span) => f
+                .debug_tuple("EventParent::Explicit")
+                .field(&span.name())
+                .finish(),
+            Self::Unknown(id) => f.debug_tuple("EventParent::Unknown").field(id).finish(),
         }
     }
 }

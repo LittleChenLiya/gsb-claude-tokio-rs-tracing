@@ -125,4 +125,135 @@ impl<'a> Event<'a> {
             _ => None,
         }
     }
+
+    /// Returns a read-only classification of where this event's parent span
+    /// comes from.
+    ///
+    /// This classifies the event's parent provenance as one of three cases:
+    ///
+    /// - [`ParentKind::Explicit`]: the event was constructed with an explicit
+    ///   parent span ID (e.g. via [`Event::new_child_of`] with `Some(id)`),
+    /// - [`ParentKind::Current`]: the event's parent is determined
+    ///   contextually, based on the current span,
+    /// - [`ParentKind::Root`]: the event has no parent. Note that an event
+    ///   constructed with an *explicit* `None` parent (e.g. via
+    ///   [`Event::new_child_of`] with `None`) is a root, and does **not** fall
+    ///   back to the current span.
+    ///
+    /// Unlike [`Event::parent`], this does not erase the distinction between
+    /// a root event and a contextually-parented event.
+    pub fn parent_kind(&self) -> ParentKind<'_> {
+        match self.parent {
+            Parent::Root => ParentKind::Root,
+            Parent::Current => ParentKind::Current,
+            Parent::Explicit(ref id) => ParentKind::Explicit(id),
+        }
+    }
+}
+
+/// A read-only classification of an [`Event`]'s parent provenance.
+///
+/// Returned by [`Event::parent_kind`]. This distinguishes the three ways an
+/// event's parent span may be determined: an explicitly-provided span ID, the
+/// current span, or no parent at all (a root event).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParentKind<'a> {
+    /// The event is a root: it has no parent.
+    ///
+    /// An event whose parent was *explicitly* set to `None` is a root, and
+    /// must not fall back to the current span.
+    Root,
+    /// The event's parent is determined contextually: if the current thread
+    /// is inside a span, that span is the event's parent; otherwise, the
+    /// event is the root of its own trace tree.
+    Current,
+    /// The event has an explicitly-specified parent, identified by the
+    /// contained span [`Id`].
+    ///
+    /// Note that the contained `Id` is only guaranteed to be meaningful to
+    /// the [`Subscriber`] that produced it; subscribers that do not recognize
+    /// the ID (for example, because the parent span was created by a
+    /// different [`Dispatch`]er) should treat the parent as unknown rather
+    /// than fabricating an association with some other span.
+    ///
+    /// [`Subscriber`]: crate::subscriber::Subscriber
+    /// [`Dispatch`]: crate::dispatcher::Dispatch
+    Explicit(&'a Id),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::callsite::{Callsite, Identifier};
+    use crate::metadata::Kind;
+    use crate::span;
+    use crate::subscriber::Interest;
+
+    struct TestCallsite;
+    static TEST_CALLSITE: TestCallsite = TestCallsite;
+
+    impl Callsite for TestCallsite {
+        fn set_interest(&self, _: Interest) {}
+        fn metadata(&self) -> &Metadata<'_> {
+            &TEST_META
+        }
+    }
+
+    static TEST_META: Metadata<'static> = Metadata::new(
+        "event_parent_kind_test",
+        "tracing_core",
+        crate::Level::INFO,
+        None,
+        None,
+        None,
+        field::FieldSet::new(&[], Identifier(&TEST_CALLSITE)),
+        Kind::EVENT,
+    );
+
+    fn with_event(f: impl FnOnce(Event<'_>)) {
+        let fields = TEST_META.fields();
+        let values = [];
+        let valueset = fields.value_set(&values);
+        f(Event::new(&TEST_META, &valueset));
+    }
+
+    fn with_event_child_of(parent: Option<Id>, f: impl FnOnce(Event<'_>)) {
+        let fields = TEST_META.fields();
+        let values = [];
+        let valueset = fields.value_set(&values);
+        f(Event::new_child_of(parent, &TEST_META, &valueset));
+    }
+
+    #[test]
+    fn parent_kind_current_by_default() {
+        with_event(|event| {
+            assert_eq!(event.parent_kind(), ParentKind::Current);
+            assert!(event.is_contextual());
+            assert!(!event.is_root());
+            assert_eq!(event.parent(), None);
+        });
+    }
+
+    #[test]
+    fn parent_kind_explicit() {
+        let id = span::Id::from_u64(42);
+        with_event_child_of(Some(id.clone()), |event| {
+            assert_eq!(event.parent_kind(), ParentKind::Explicit(&id));
+            assert_eq!(event.parent(), Some(&id));
+            assert!(!event.is_contextual());
+            assert!(!event.is_root());
+        });
+    }
+
+    #[test]
+    fn parent_kind_explicit_none_is_root_not_current() {
+        // An explicit `None` parent must be classified as a root, and must
+        // *not* fall back to the current span.
+        with_event_child_of(None, |event| {
+            assert_eq!(event.parent_kind(), ParentKind::Root);
+            assert!(event.is_root());
+            assert!(!event.is_contextual());
+            assert_eq!(event.parent(), None);
+        });
+    }
 }

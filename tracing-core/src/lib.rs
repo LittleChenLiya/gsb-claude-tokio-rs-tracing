@@ -296,7 +296,7 @@ pub(crate) use std::sync;
 pub use self::{
     callsite::Callsite,
     dispatcher::Dispatch,
-    event::Event,
+    event::{Event, ParentKind},
     field::Field,
     metadata::{Level, LevelFilter, Metadata},
     subscriber::Subscriber,

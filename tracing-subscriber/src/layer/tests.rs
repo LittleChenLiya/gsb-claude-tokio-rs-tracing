@@ -156,6 +156,100 @@ mod registry_tests {
         );
     }
 
+    #[test]
+    fn context_event_parent() {
+        use crate::layer::EventParent;
+        use std::sync::{Arc, Mutex};
+
+        /// A small in-memory fixture recording how each received event's
+        /// parent was classified.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum Recorded {
+            Root,
+            Current(Option<&'static str>),
+            Explicit(&'static str),
+            Unknown,
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        struct RecordingLayer {
+            events: Arc<Mutex<Vec<Recorded>>>,
+        }
+
+        impl<S> Layer<S> for RecordingLayer
+        where
+            S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+        {
+            fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+                let recorded = match ctx.event_parent(event) {
+                    EventParent::Root => Recorded::Root,
+                    EventParent::Current(current) => {
+                        Recorded::Current(current.map(|span| span.name()))
+                    }
+                    EventParent::Explicit(span) => Recorded::Explicit(span.name()),
+                    EventParent::Unknown(_) => Recorded::Unknown,
+                };
+                self.events.lock().unwrap().push(recorded);
+            }
+        }
+
+        /// A subscriber standing in for a foreign `Dispatch`er: spans it
+        /// creates get IDs that the registry under test will never know.
+        struct ForeignSubscriber;
+        impl Subscriber for ForeignSubscriber {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(u64::MAX)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        // Create a span owned by a *different* dispatcher. Its ID is unknown
+        // to the registry under test below.
+        let foreign =
+            tracing::subscriber::with_default(ForeignSubscriber, || tracing::info_span!("foreign"));
+
+        tracing::subscriber::with_default(
+            crate::registry().with(RecordingLayer {
+                events: events.clone(),
+            }),
+            || {
+                let _guard = tracing::info_span!("outer").entered();
+                let explicit = tracing::info_span!("explicit");
+
+                // One event of each parent kind, in order, inside `outer`:
+                tracing::info!("contextual parent");
+                tracing::info!(parent: &explicit, "explicit parent");
+                tracing::info!(parent: None, "explicit root");
+                // ...plus an event whose parent belongs to another dispatcher:
+                tracing::info!(parent: &foreign, "foreign parent");
+            },
+        );
+
+        // All four events must have been dispatched to the subscriber
+        // unchanged, and each parent provenance must be classified correctly.
+        // In particular, the explicit root must not fall back to the current
+        // span, and the foreign parent must be reported as unknown rather
+        // than being associated with a fabricated span.
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.as_slice(),
+            &[
+                Recorded::Current(Some("outer")),
+                Recorded::Explicit("explicit"),
+                Recorded::Root,
+                Recorded::Unknown,
+            ],
+        );
+    }
+
     /// Tests for how max-level hints are calculated when combining layers
     /// with and without per-layer filtering.
     mod max_level_hints {
