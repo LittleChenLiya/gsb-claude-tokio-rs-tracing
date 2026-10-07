@@ -49,6 +49,9 @@ impl<'a> Event<'a> {
 
     /// Returns a new `Event` as a child of the specified span, with the
     /// provided metadata and set of values.
+    ///
+    /// If `parent` is `None`, the event is explicitly a root ([`ParentKind::Root`]);
+    /// it does *not* fall back to the current span.
     #[inline]
     pub fn new_child_of(
         parent: impl Into<Option<Id>>,
@@ -99,9 +102,29 @@ impl<'a> Event<'a> {
         self.metadata
     }
 
+    /// Returns a read-only classification of this event's parent provenance.
+    ///
+    /// This distinguishes the three possible sources of an event's parent:
+    /// an [explicitly-specified] parent span, the [current] span (determined
+    /// contextually), or [no parent] at all. Unlike [`Event::parent`], the
+    /// returned [`ParentKind`] does not collapse the "contextual" and "root"
+    /// cases into `None`, so observers can tell them apart without changing
+    /// how the event is dispatched to subscribers.
+    ///
+    /// [explicitly-specified]: ParentKind::Explicit
+    /// [current]: ParentKind::Current
+    /// [no parent]: ParentKind::Root
+    pub fn parent_kind(&self) -> ParentKind<'_> {
+        match self.parent {
+            Parent::Root => ParentKind::Root,
+            Parent::Current => ParentKind::Current,
+            Parent::Explicit(ref p) => ParentKind::Explicit(p),
+        }
+    }
+
     /// Returns true if the new event should be a root.
     pub fn is_root(&self) -> bool {
-        matches!(self.parent, Parent::Root)
+        matches!(self.parent_kind(), ParentKind::Root)
     }
 
     /// Returns true if the new event's parent should be determined based on the
@@ -112,7 +135,7 @@ impl<'a> Event<'a> {
     /// thread is _not_ inside a span, then the new event will be the root of its
     /// own trace tree.
     pub fn is_contextual(&self) -> bool {
-        matches!(self.parent, Parent::Current)
+        matches!(self.parent_kind(), ParentKind::Current)
     }
 
     /// Returns the new event's explicitly-specified parent, if there is one.
@@ -120,9 +143,43 @@ impl<'a> Event<'a> {
     /// Otherwise (if the new event is a root or is a child of the current span),
     /// returns `None`.
     pub fn parent(&self) -> Option<&Id> {
-        match self.parent {
-            Parent::Explicit(ref p) => Some(p),
+        match self.parent_kind() {
+            ParentKind::Explicit(p) => Some(p),
             _ => None,
         }
     }
+}
+
+/// A read-only classification of an [`Event`]'s parent provenance, returned by
+/// [`Event::parent_kind`].
+///
+/// This classifies where an event's parent span comes from, without
+/// exposing a way to mutate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ParentKind<'a> {
+    /// The event has an explicitly-specified parent span, identified by its
+    /// [`Id`].
+    ///
+    /// Note that the [`Id`] is not guaranteed to refer to a span that the
+    /// current [`Subscriber`] knows about: it may identify a span that was
+    /// created by a *different* [`Dispatch`] (for example, if the span
+    /// crossed a dispatcher boundary). Subscribers resolving the parent
+    /// should treat such IDs as unknown rather than fabricating an
+    /// association with an unrelated span.
+    ///
+    /// [`Subscriber`]: crate::Subscriber
+    /// [`Dispatch`]: crate::Dispatch
+    Explicit(&'a Id),
+
+    /// The event's parent is determined based on the current context: if a
+    /// span is currently entered on this thread, that span is the parent;
+    /// otherwise, the event is the root of its own trace tree.
+    Current,
+
+    /// The event has no parent; it is the root of its own trace tree.
+    ///
+    /// This is the result of *explicitly* requesting no parent (e.g. via
+    /// [`Event::new_child_of`] with a `None` parent). An explicit `None`
+    /// parent never falls back to the current span.
+    Root,
 }

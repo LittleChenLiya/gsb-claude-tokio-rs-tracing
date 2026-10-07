@@ -156,6 +156,80 @@ mod registry_tests {
         );
     }
 
+    #[test]
+    fn context_event_parent_kind() {
+        use std::{
+            format,
+            string::{String, ToString},
+            sync::{Arc, Mutex},
+            vec,
+        };
+
+        use crate::layer::EventParent;
+
+        let kinds = Arc::new(Mutex::new(Vec::new()));
+
+        struct RecordingLayer {
+            kinds: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl<S> Layer<S> for RecordingLayer
+        where
+            S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+        {
+            fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+                let kind = match ctx.event_parent_kind(event) {
+                    EventParent::Explicit(span) => format!("explicit({})", span.name()),
+                    EventParent::Current(span) => format!("current({:?})", span.map(|s| s.name())),
+                    EventParent::Root => "root".to_string(),
+                    EventParent::Unknown(id) => format!("unknown({:?})", id),
+                };
+                self.kinds.lock().unwrap().push(kind);
+            }
+        }
+
+        // A span created under a *different* dispatcher. Its ID is unknown to
+        // the registry used below, so events naming it as their parent must be
+        // classified as `Unknown` rather than being associated with an
+        // unrelated span. Two spans are created so that the foreign ID (2)
+        // does not collide with the main registry's first span ID (1).
+        let foreign_dispatch = tracing::Dispatch::new(crate::registry());
+        let foreign_id = tracing::dispatcher::with_default(&foreign_dispatch, || {
+            let _first = tracing::info_span!("foreign_first");
+            let foreign = tracing::info_span!("foreign");
+            foreign.id().expect("foreign span should be enabled")
+        });
+
+        tracing::subscriber::with_default(
+            crate::registry().with(RecordingLayer {
+                kinds: kinds.clone(),
+            }),
+            || {
+                let main = tracing::info_span!("main");
+                let _guard = main.enter();
+
+                tracing::info!(parent: &main, "explicit parent");
+                tracing::info!("contextual parent");
+                tracing::info!(parent: None, "no parent");
+                tracing::info!(parent: foreign_id.clone(), "foreign parent");
+            },
+        );
+
+        let kinds = kinds.lock().unwrap();
+        assert_eq!(
+            *kinds,
+            vec![
+                "explicit(main)".to_string(),
+                "current(Some(\"main\"))".to_string(),
+                "root".to_string(),
+                format!("unknown({:?})", foreign_id),
+            ],
+        );
+        // All four events were delivered to the layer: classifying the parent
+        // provenance does not change how events are dispatched.
+        assert_eq!(kinds.len(), 4);
+    }
+
     /// Tests for how max-level hints are calculated when combining layers
     /// with and without per-layer filtering.
     mod max_level_hints {
